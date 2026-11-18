@@ -1,0 +1,13 @@
+{
+  "name": "paper-dual-qoder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "论文双降工作台 Qoder CN 插件（MCP 服务与页面，零 npm 依赖）",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check app.js",
+    "smoke": "node scripts/smoke.mjs",
+    "integration": "node scripts/integration.mjs"
+  }
+}

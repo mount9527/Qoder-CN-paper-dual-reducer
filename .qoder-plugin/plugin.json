@@ -1,0 +1,7 @@
+{
+  "name": "paper-dual-qoder",
+  "version": "0.1.0",
+  "description": "中文论文双降工作台：9 维痕迹诊断 + 篇内重复定位 + 门禁改写闭环 + 版本链与恶化自动回退（离线核心，零第三方依赖）",
+  "author": { "name": "mount9527" },
+  "keywords": ["qoder-plugin", "academic-writing", "docx", "chinese", "paper"]
+}

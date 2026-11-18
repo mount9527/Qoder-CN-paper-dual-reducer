@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>论文双降工作台</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2430; --muted: #5b6675;
+    --line: #e2e6ec; --accent: #2f6feb; --accent-ink: #ffffff;
+    --ok: #1a7f4b; --ok-bg: #e6f4ec; --warn: #9a6700; --warn-bg: #fff4d6;
+    --bad: #b42318; --bad-bg: #fdecea; --chip: #eef1f6; --focus: #2f6feb;
+    --radius: 10px; --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  [data-theme="dark"] {
+    --bg: #14181e; --panel: #1d232b; --ink: #e7ebf0; --muted: #9aa5b3;
+    --line: #2c343e; --accent: #5b8cff; --accent-ink: #0d1117;
+    --ok: #4cc38a; --ok-bg: #16281f; --warn: #e3b341; --warn-bg: #2b2410;
+    --bad: #f47067; --bad-bg: #2d1714; --chip: #262d36; --focus: #5b8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 18px 64px; }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  h2 { font-size: 15px; margin: 26px 0 10px; }
+  h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
+  .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+  input[type=text], select, textarea {
+    width: 100%; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 11px; font: inherit;
+  }
+  textarea { font-family: var(--mono); font-size: 12.5px; min-height: 130px; resize: vertical; }
+  input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > .grow { flex: 1 1 320px; }
+  button {
+    background: var(--accent); color: var(--accent-ink); border: none; border-radius: 8px;
+    padding: 9px 15px; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  button.secondary { background: var(--chip); color: var(--ink); font-weight: 500; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); font-weight: 500; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .card { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; }
+  .card .k { font-size: 12px; color: var(--muted); }
+  .card .v { font-size: 21px; font-weight: 700; margin-top: 2px; }
+  .card .v small { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--chip); border-radius: 20px; padding: 3px 11px; font-size: 12px; }
+  .chip b { font-weight: 700; }
+  .badge { display: inline-block; border-radius: 6px; padding: 2px 9px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.wrap { word-break: break-word; min-width: 180px; }
+  .table-scroll { overflow-x: auto; }
+  .status { font-size: 12.5px; padding: 8px 0; min-height: 20px; color: var(--muted); }
+  .status[data-error="true"] { color: var(--bad); }
+  .versions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .versions button { padding: 5px 12px; font-size: 12.5px; }
+  .versions button[aria-current="true"] { outline: 2px solid var(--focus); }
+  .hidden { display: none !important; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+  .note { font-size: 12.5px; color: var(--warn); background: var(--warn-bg); border-radius: 8px; padding: 8px 11px; margin: 8px 0; }
+  .report { font-size: 13px; }
+  .report h1 { font-size: 17px; } .report h2 { font-size: 15px; } .report h3 { font-size: 13.5px; color: var(--ink); }
+  .report table { margin: 8px 0; } .report blockquote { border-left: 3px solid var(--line); margin: 8px 0; padding: 2px 12px; color: var(--muted); }
+  .report code { font-family: var(--mono); background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+  .report ul { padding-left: 20px; }
+  footer { margin-top: 30px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 14px; }
+  footer li { margin: 3px 0; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { background: var(--panel); color: var(--ink); border-radius: 0; font-weight: 500; padding: 7px 13px; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+  details { margin: 6px 0; } summary { cursor: pointer; font-size: 12.5px; color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>论文双降工作台</h1>
+  <p class="sub">诊断 → 生成任务 → 改写 → 门禁预检 → 回填复检 → 报告 · 离线核心 · 原文只读</p>
+  <div class="status" id="status" role="status" aria-live="polite">正在连接宿主…</div>
+
+  <section class="panel" id="entry">
+    <div class="row">
+      <div class="grow">
+        <label for="path">论文 .docx 绝对路径</label>
+        <input type="text" id="path" placeholder="例如 E:\papers\我的论文.docx" autocomplete="off">
+      </div>
+      <button id="diagnose">诊断</button>
+      <button id="refresh" class="secondary">刷新状态</button>
+    </div>
+    <div id="recent" class="hidden" style="margin-top:12px">
+      <h3>最近文档</h3>
+      <div class="chips" id="recent-list"></div>
+    </div>
+  </section>
+
+  <section class="panel hidden" id="overview">
+    <h2 style="margin-top:0">诊断概览 <span class="mono muted" id="doc-name"></span></h2>
+    <div class="cards" id="cards"></div>
+    <h3>9 维痕迹命中</h3>
+    <div class="chips" id="dims"></div>
+    <h3>Top 高风险 / 重复段落</h3>
+    <div class="table-scroll"><table id="top-table">
+      <thead><tr><th>pid</th><th>风险</th><th>分</th><th>重复</th><th>算子</th><th>原文预览</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <h3>生成改写任务</h3>
+    <div class="row">
+      <div>
+        <label>模式</label>
+        <div class="seg" id="mode" role="group" aria-label="模式">
+          <button data-mode="dual" aria-pressed="true">双降</button>
+          <button data-mode="aigc" aria-pressed="false">降 AI 痕迹</button>
+          <button data-mode="dedup" aria-pressed="false">降篇内重复</button>
+        </div>
+      </div>
+      <div>
+        <label for="style">文风</label>
+        <select id="style"><option value="plain">平实 plain</option><option value="academic">学术 academic</option></select>
+      </div>
+      <button id="rewrite">生成改写任务</button>
+    </div>
+    <div class="note hidden" id="rewrite-note"></div>
+  </section>
+
+  <section class="panel hidden" id="task">
+    <h2 style="margin-top:0">改写任务 <span class="badge warn" id="round-badge"></span></h2>
+    <p class="muted" id="task-meta"></p>
+    <div class="actions">
+      <button id="copy-prompt" class="secondary">复制整段指令</button>
+      <button id="ask-agent" class="ghost">让 agent 改写本轮</button>
+    </div>
+    <details><summary>查看任务清单（prompts）</summary>
+      <div class="table-scroll"><table id="prompt-table">
+        <thead><tr><th>pid</th><th>算子</th><th>分</th><th>重复</th><th>要求</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </details>
+    <h3>回填清单 edits.jsonl</h3>
+    <label for="edits">一行一条 {"pid","text","op"}；可由 agent 写入，或在此粘贴</label>
+    <textarea id="edits" placeholder='{"pid":"p0001","text":"改写后的整段文字","op":"O5"}'></textarea>
+    <div class="actions">
+      <button id="save-edits" class="secondary">校验并保存</button>
+      <button id="lint" class="secondary">预检</button>
+      <button id="finish">回填并复检</button>
+    </div>
+    <div id="lint-result"></div>
+  </section>
+
+  <section class="panel hidden" id="result">
+    <h2 style="margin-top:0">版本链与报告</h2>
+    <div class="versions" id="versions"></div>
+    <div id="verdict"></div>
+    <div class="table-scroll" id="metrics-wrap"><table id="metrics">
+      <thead><tr><th>指标</th><th>基础稿</th><th>改稿</th></tr></thead><tbody></tbody>
+    </table></div>
+    <div class="actions">
+      <button id="dl-docx" class="secondary">下载改稿 docx</button>
+      <button id="dl-report" class="secondary">下载报告 md</button>
+      <button id="open-report" class="ghost">在编辑器打开报告</button>
+    </div>
+    <h3>三栏对照</h3>
+    <div class="table-scroll"><table id="compare">
+      <thead><tr><th>pid</th><th>原文</th><th>改文</th><th>字数</th><th>句数</th></tr></thead><tbody></tbody>
+    </table></div>
+    <div id="rejected"></div>
+    <h3>报告</h3>
+    <div class="report" id="report"></div>
+  </section>
+
+  <footer>
+    <ul>
+      <li>风险分与重复率是篇内相对指标，只用于同篇排序，不是任何检测平台的概率；不承诺通过率。</li>
+      <li>标题、表格、代码、公式、脚注、参考文献一律不改；不新增数字/引用/事实。</li>
+      <li>v0.1 为离线核心，无真机 AIGC 模型分数；改稿必须由作者逐段复核。文档不出本机。</li>
+    </ul>
+  </footer>
+</main>
+<script>
+/* APP_SCRIPT */
+</script>
+</body>
+</html>
