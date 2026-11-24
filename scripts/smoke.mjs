@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { join } from "node:path"
 
@@ -47,6 +48,8 @@ try {
   const open = tools.find(t => t.name === "open_workbench")
   check("open_workbench 声明 ui resourceUri", open?._meta?.ui?.resourceUri === "ui://paper-dual/main.html")
   check("open_workbench 全局+会话入口", JSON.stringify(open._meta["qoder/ui"].entrypoints) === JSON.stringify([{ type: "global" }, { type: "thread" }]))
+  const icon = await readFile(join(ROOT, "assets", "icon.png"))
+  check("open_workbench 声明打包图标", open.icons?.[0]?.src === "data:image/png;base64," + icon.toString("base64") && open.icons[0].mimeType === "image/png")
   check("页面写操作仅 app 可见", tools.filter(t => t._meta?.ui?.visibility?.includes("app")).length === 5)
   check("模型工具不含 app-only", !tools.find(t => t.name === "pd_save_edits")._meta.ui.visibility.includes("model"))
 
@@ -56,6 +59,16 @@ try {
   const content = rr.result.contents[0]
   check("资源 mime 正确", content.mimeType === "text/html;profile=mcp-app")
   check("页面脚本已内联", content.text.includes("ui/initialize") && !content.text.includes("/* APP_SCRIPT */"))
+  check("工作台含显式部分完成开关", content.text.includes('id="allow-partial"') && content.text.includes("允许部分完成"))
+  check("工作台区分通过未通过拒绝", content.text.includes("候选稿已回退") && content.text.includes("基础稿不变")
+    && content.text.includes("不表示检测概率"))
+  check("报告视图含直接下载分支", content.text.includes("lastView?.reportDownload"))
+  const lintFlow = content.text.slice(content.text.indexOf('$("#lint").addEventListener'), content.text.indexOf('$("#finish").addEventListener'))
+  const finishFlow = content.text.slice(content.text.indexOf('$("#finish").addEventListener'), content.text.indexOf('async function download'))
+  check("预检先保存当前输入", lintFlow.includes('await tool("pd_save_edits", { path: currentPath, jsonl })'))
+  check("回填先保存当前输入", finishFlow.includes('await tool("pd_save_edits", { path: currentPath, jsonl })'))
+  const apply = tools.find(t => t.name === "paper_dual_apply_edits")
+  check("回填工具声明 allowPartial", apply.inputSchema.properties.allowPartial?.type === "boolean")
   check("声明全屏优先", content._meta["qoder/ui"].preferredDisplayMode === "fullscreen")
 
   const st = await rpc("tools/call", { name: "paper_dual_status", arguments: {} })

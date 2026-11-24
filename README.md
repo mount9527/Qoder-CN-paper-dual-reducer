@@ -10,18 +10,21 @@
 
 流水线：**诊断 → 生成改写任务 → 改写 → 门禁预检 → 回填 → 复检 → 报告**。
 
-- **诊断**：9 维痕迹诊断（模板套话/被动句/句长起伏/结构对称/层层嵌套/冒号列举/标点节奏/口语化/破折号，纯正则离线）+ 13 字指纹篇内重复定位 + 锁定区统计。
+- **诊断**：9 个文风规则维度（模板套话/被动句/句长起伏/结构对称/层层嵌套/冒号列举/标点节奏/口语化/破折号，纯正则离线）+ 13 字指纹篇内重复定位 + 锁定区统计。
 - **三种模式**：降篇内重复（dedup）、降 AI 痕迹（aigc）、双降（dual，一次改写同时注入两类要求）。
 - **改写闭环**：在 Qoder 里 **agent 亲自改写**（不必复制提示词到外部模型），五道门禁逐段把关，回填后篇级复检，恶化整篇自动回退。
 - **版本链**：原文 → 改稿 → 二改 … 最多五改；每轮基于上一版已验收稿；被拒稿留档不覆盖。
-- **格式保形**：标题/表格/代码/公式/脚注/参考文献一律不改；段落与字符属性零漂移；zip 其他条目逐字节复制。
-- **可视化工作台**：左侧「更多」菜单打开「论文双降工作台」，填路径诊断、切版本、三栏对照、渲染报告、下载改稿。
+- **格式保形**：标题/表格/代码/公式/脚注/参考文献/附录一律不改；支持本地化标题样式与继承链，手动加粗的文献标题也锁定；智能标签等嵌套文本容器保守锁定；zip 其他条目逐字节复制。
+- **可靠状态**：同文档跨进程锁、原子状态替换、重新诊断事务保护；无效新文档不会挤掉旧状态。
+- **明确验收**：本轮任务默认必须全部提交并通过；只有用户明确同意后，才允许跳过被拒/未提交段。结果区分通过、未通过（候选稿已回退）、拒绝（输入或任务集不合格），不表示平台通过概率。
+- **合理阈值**：字二元组语义代理下限 0.40；重复率允许上升 0.002（0.2 个百分点）；风险分持平不判失败，避免机械阈值挡住可用改稿。
+- **可视化工作台**：左侧「更多」菜单打开「论文双降工作台」，填路径诊断、切版本、三栏对照、渲染报告、下载改稿；预检与回填会先保存当前粘贴的清单，避免检查或提交旧内容。
 
 ## 依赖
 
 - **Python 3.10+**（引擎，零第三方依赖）。`python` 不在 PATH 时可用环境变量 `PAPER_DUAL_PYTHON` 指定解释器。
 - **Node.js**（仅工作台 MCP 服务需要；Qoder Desktop 环境自带）。
-- 真机 AIGC 模型检测（torch + transformers）**v0.1 未包含**，计划后续版本提供；未提供前不产生模型分数。
+- 真机 AIGC 模型检测（torch + transformers）**当前版本未包含**；`doctor` 区分未配置与配置了尚未支持的模型，两者均不产生模型分数。
 
 ## 安装
 
@@ -47,25 +50,31 @@ python skills/paper-dual/scripts/engine.py rewrite  --path /abs/paper.docx --mod
 # agent 按 prompts.jsonl 写 edits.jsonl（一行一条 {"pid","text","op"}）
 python skills/paper-dual/scripts/engine.py lint     --path /abs/paper.docx
 python skills/paper-dual/scripts/engine.py finish   --path /abs/paper.docx
+# 仅在用户明确同意跳过被拒/未提交段时：
+python skills/paper-dual/scripts/engine.py finish   --path /abs/paper.docx --allow-partial
 python skills/paper-dual/scripts/engine.py status   --path /abs/paper.docx
 ```
 
-每个子命令输出单个 JSON。状态目录默认 `~/.qoder-cn/paper-dual/`，`PAPER_DUAL_STATE_DIR` 可重定向。
+每个子命令输出单个 JSON。`lint` 未通过与 `finish` 未通过/拒绝时退出码为 2，防止 shell 链误继续。状态目录默认 `~/.qoder-cn/paper-dual/`，`PAPER_DUAL_STATE_DIR` 可重定向。
 
 ## 测试
 
 ```sh
-python skills/paper-dual/scripts/test_engine.py   # 夹具 docx 全链路 + 篡改反例，71 项断言
+npm test                                         # 引擎回归 + 语法 + MCP 冒烟/集成
+npm run test:engine                              # 夹具 docx 全链路 + 篡改反例 + 并发/事务/样式/预算，115 项断言
 npm run check                                     # 工作台静态语法检查
-npm run smoke                                     # MCP 协议子进程冒烟测试（16 项）
-npm run integration                               # 经 MCP 服务跑完整闭环（11 项）
+npm run smoke                                     # MCP 协议子进程冒烟测试（23 项）
+npm run integration                               # 经 MCP 服务跑完整闭环（15 项）
+npm run test:ui                                   # 本地浏览器工作台回归宿主（需连接 Qoder 浏览器）
+node dist/ui-harness.mjs                          # 可选：独立浏览器 + 真实 MCP 子进程验证（非 Qoder 宿主验收）
 ```
 
 ## 边界（请先读）
 
-- 风险分/重复率是**篇内相对指标**，不是任何平台检测概率；不模拟知网/维普/格子达，不承诺通过率。
+- 风险分/重复率是**篇内相对指标**，不是任何平台检测概率；不模拟知网/维普/格子达，不承诺通过率。早期说明中的 6 维是旧口径；当前 9 维是文风规则，并非独立检测模型。门禁通过不等于原稿更优，请比较后替换。
 - 只改正文，锁定区一律不动；不新增数字/引用/事实；改稿必须由作者逐段复核。
 - 文档不出本机；引擎不读 token、不写远端。
+- DOCX 资源预算：ZIP 最多 10,000 条目、解压后总计 256 MiB、单个 XML 64 MiB；超限显式拒绝。
 - 含文本框/嵌套结构的文档可能无法安全回填（诊断仍可用），引擎显式报错保护原件。
 
 ## 目录

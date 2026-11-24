@@ -19,8 +19,9 @@ function request(method, params) {
 }
 async function tool(name, args) {
   const r = await request("tools/call", { name, arguments: args })
+  if (r?.structuredContent) return r.structuredContent
   if (r?.isError) throw new Error(r.content?.[0]?.text || "操作失败")
-  return r?.structuredContent ?? {}
+  return {}
 }
 function size() {
   if (!closed && context.displayMode === "inline")
@@ -100,7 +101,7 @@ function renderOverview(diag) {
   $("#doc-name").textContent = diag.doc.name
   const cards = [
     ["篇内重复率", pct(diag.repeat.rate), `${diag.repeat.covered_chars}/${diag.repeat.total_chars} 字`],
-    ["风险 高/中/低", `${diag.risk.high}/${diag.risk.mid}/${diag.risk.low}`, `总分 ${diag.risk.total_score}`],
+    ["文风分 高/中/低分段", `${diag.risk.high}/${diag.risk.mid}/${diag.risk.low}`, `总分 ${diag.risk.total_score}`],
     ["段落 总/可改写", `${diag.doc.paragraphs}/${diag.doc.rewritable}`, `锁定 ${diag.doc.locked}`],
   ]
   $("#cards").textContent = ""
@@ -119,7 +120,7 @@ function renderOverview(diag) {
   const tb = $("#top-table tbody"); tb.textContent = ""
   for (const r of diag.risk.top) {
     const tr = document.createElement("tr")
-    tr.innerHTML = `<td class="mono">${esc(r.pid)}</td><td><span class="badge ${bandBadge(r.band)}">${esc(r.band)}</span></td>` +
+    tr.innerHTML = `<td class="mono">${esc(r.pid)}</td><td><span class="badge ${bandBadge(r.band)}">${esc(r.band)}分段</span></td>` +
       `<td>${r.score}</td><td>${pct(r.repeat_ratio)}</td><td class="mono">${esc(r.ops.join(","))}</td><td class="wrap">${esc(r.text)}</td>`
     tb.appendChild(tr)
   }
@@ -135,7 +136,10 @@ function renderVersions(st) {
     box.appendChild(b)
   }
   mk("原文", 0, viewRound === 0)
-  for (const r of st.rounds) mk(`v${r.n} ${r.status === "accepted" ? "✓" : r.status === "rejected" ? "✗" : "…"}`, r.n, viewRound === r.n)
+  for (const r of st.rounds) {
+    const label = r.status === "accepted" ? (r.partial ? "通过（部分完成）" : "通过") : r.status === "rejected" ? (r.check_status === "not_passed" ? "未通过" : "拒绝") : "待回填"
+    mk(`v${r.n} ${label}`, r.n, viewRound === r.n)
+  }
   show("result", st.rounds.length > 0)
 }
 function renderTask(p) {
@@ -153,9 +157,19 @@ function renderTask(p) {
 function renderLint(j) {
   const box = $("#lint-result"); box.textContent = ""
   if (!j) return
+  const failed = j.ok === false || (j.errors || []).length > 0
   const head = document.createElement("p")
-  head.innerHTML = `<span class="badge ${j.rejected_count ? "warn" : "ok"}">通过 ${j.passed_count} · 被拒 ${j.rejected_count}</span>`
+  const badge = document.createElement("span")
+  const state = j.check_status === "rejected" ? "拒绝" : j.check_status === "not_passed" ? "未通过" : failed ? "未通过" : "通过"
+  badge.className = "badge " + (state === "拒绝" ? "bad" : state === "未通过" ? "warn" : "ok")
+  badge.textContent = `预检${state} · 通过 ${j.passed_count ?? 0} · 被拒 ${j.rejected_count ?? 0}`
+  head.appendChild(badge)
   box.appendChild(head)
+  for (const error of j.errors || []) {
+    const d = document.createElement("div"); d.className = "note"
+    d.textContent = "清单错误：" + error
+    box.appendChild(d)
+  }
   for (const r of j.rejected || []) {
     const d = document.createElement("div"); d.className = "note"
     d.textContent = `${r.pid}：` + r.gates.map(g => `${g.gate}：${g.detail}`).join("；")
@@ -167,8 +181,11 @@ function renderView(v) {
   const c = v.comparison
   const vb = $("#verdict"); vb.textContent = ""
   const badge = document.createElement("span")
-  badge.className = "badge " + (c.verdict === "accepted" ? "ok" : "bad")
-  badge.textContent = c.verdict === "accepted" ? `第 ${c.round} 轮 · 通过` : `第 ${c.round} 轮 · 拒绝（已回退）`
+  const notPassed = c.verdict === "rejected" && c.check_status === "not_passed"
+  badge.className = "badge " + (c.verdict === "accepted" ? (c.partial ? "warn" : "ok") : notPassed ? "warn" : "bad")
+  badge.textContent = c.verdict === "accepted"
+    ? `第 ${c.round} 轮 · ${c.partial ? "通过（部分完成，已跳过未通过/未提交段）" : "通过"}`
+    : `第 ${c.round} 轮 · ${notPassed ? "未通过（候选稿已回退）" : "拒绝（输入或任务集不合格，基础稿不变）"}`
   vb.appendChild(badge)
   if (c.reasons?.length) {
     const n = document.createElement("div"); n.className = "note"; n.textContent = c.reasons.join("；")
@@ -177,8 +194,8 @@ function renderView(v) {
   const mb = c.metrics_before, ma = c.metrics_after
   const mt = $("#metrics tbody"); mt.textContent = ""
   const rows = [["篇内重复率", pct(mb.repeat_rate), ma ? pct(ma.repeat_rate) : "—"],
-    ["痕迹风险总分", mb.risk_total, ma ? ma.risk_total : "—"],
-    ["高/中/低风险段", `${mb.high}/${mb.mid}/${mb.low}`, ma ? `${ma.high}/${ma.mid}/${ma.low}` : "—"]]
+    ["文风痕迹总分", mb.risk_total, ma ? ma.risk_total : "—"],
+    ["高/中/低分段段数", `${mb.high}/${mb.mid}/${mb.low}`, ma ? `${ma.high}/${ma.mid}/${ma.low}` : "—"]]
   for (const r of rows) {
     const tr = document.createElement("tr")
     tr.innerHTML = r.map((x, i) => `<td${i === 0 ? "" : ' class="mono"'}>${esc(x)}</td>`).join("")
@@ -228,13 +245,14 @@ async function loadDoc(path) {
 async function loadView(round, st) {
   viewRound = round
   if (round === 0) {
+    lastView = null
     const diag = await tool("pd_get_diagnosis", { path: currentPath })
     renderVersions(st || await tool("paper_dual_status", { path: currentPath }))
     $("#verdict").innerHTML = '<span class="badge ok">原文（只读快照）</span>'
     $("#metrics tbody").textContent = ""
     $("#compare tbody").textContent = ""
     $("#rejected").textContent = ""
-    $("#report").innerHTML = renderMarkdown(`# 原文诊断\n\n篇内重复率 ${pct(diag.repeat.rate)}，痕迹风险总分 ${diag.risk.total_score}，高风险段 ${diag.risk.high}。\n\n原文尚未改写。生成任务并回填后，这里显示三栏对照与报告。`)
+    $("#report").innerHTML = renderMarkdown(`# 原文诊断\n\n篇内重复率 ${pct(diag.repeat.rate)}，文风痕迹总分 ${diag.risk.total_score}，高分段段数 ${diag.risk.high}。\n\n早期说明中的 6 维是旧口径；当前为 9 个文风规则维度，并非 9 个独立检测模型。\n\n原文尚未改写。门禁通过不等于原稿更优，请比较后替换。`)
     show("result", true); size(); return
   }
   const v = await tool("pd_get_view", { path: currentPath, round })
@@ -255,7 +273,7 @@ $("#diagnose").addEventListener("click", () => {
   if (!path) { report("请先填写论文 .docx 绝对路径。", true); return }
   void act(async () => {
     const j = await tool("paper_dual_diagnose", { path })
-    report(`诊断完成：重复率 ${pct(j.repeat.rate)}，高风险段 ${j.risk.high}。`)
+    report(`诊断完成：重复率 ${pct(j.repeat.rate)}，高分段段数 ${j.risk.high}。`)
     await loadDoc(path)
   }, "诊断中（只读原件）…")
 })
@@ -307,17 +325,35 @@ $("#save-edits").addEventListener("click", () => {
   }, "校验并保存清单…")
 })
 $("#lint").addEventListener("click", () => {
-  void act(async () => { renderLint(await tool("paper_dual_lint", { path: currentPath })); report("预检完成。") }, "预检中…")
+  void act(async () => {
+    const jsonl = $("#edits").value.trim()
+    if (jsonl) {
+      try { await tool("pd_save_edits", { path: currentPath, jsonl }) }
+      catch (e) { renderLint({ ok: false, check_status: "rejected", errors: [e.message] }); throw e }
+    }
+    const j = await tool("paper_dual_lint", { path: currentPath })
+    renderLint(j)
+    report(j.ok ? "预检通过。" : `预检${j.check_status === "rejected" ? "拒绝" : "未通过"}，请查看门禁原因。`, !j.ok)
+  }, "预检中…")
 })
 $("#finish").addEventListener("click", () => {
   void act(async () => {
-    const j = await tool("paper_dual_apply_edits", { path: currentPath })
-    report(j.verdict === "accepted" ? `第 ${j.round} 轮回填通过。` : `第 ${j.round} 轮被拒并已回退：${(j.reasons || []).join("；")}`, j.verdict !== "accepted")
+    const jsonl = $("#edits").value.trim()
+    if (jsonl) await tool("pd_save_edits", { path: currentPath, jsonl })
+    const allowPartial = $("#allow-partial").checked
+    const j = await tool("paper_dual_apply_edits", { path: currentPath, allowPartial })
+    const message = j.verdict === "accepted"
+      ? `第 ${j.round} 轮${j.partial ? "部分完成并通过" : "回填通过"}；请比较后替换，并由作者复核。`
+      : `第 ${j.round} 轮${j.check_status === "not_passed" ? "未通过，候选稿已回退" : "拒绝，基础稿不变"}：${(j.reasons || []).join("；")}`
+    report(message, j.verdict !== "accepted")
     await loadDoc(currentPath)
+    report(message, j.verdict !== "accepted")
   }, "回填并复检…")
 })
 async function download(kind) {
-  const v = await tool("pd_get_file", { path: currentPath, round: viewRound || undefined, kind })
+  const v = kind === "report" && lastView?.reportDownload
+    ? lastView.reportDownload
+    : await tool("pd_get_file", { path: currentPath, round: viewRound || undefined, kind })
   const resource = v.base64
     ? { uri: `file:///${v.filename}`, mimeType: v.mimeType, blob: v.base64 }
     : { uri: `file:///${v.filename}`, mimeType: v.mimeType, text: v.text }
@@ -376,7 +412,7 @@ if (window.parent === window) {
   report("请在 Qoder 中打开本插件；直接打开 HTML 不会连接宿主。")
 } else {
   request("ui/initialize", {
-    protocolVersion: "2026-01-26", appInfo: { name: "paper-dual-qoder", version: "0.1.0" },
+    protocolVersion: "2026-01-26", appInfo: { name: "paper-dual-qoder", version: "0.2.1" },
     appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
   }).then(result => {
     if (closed) return

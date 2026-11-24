@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url"
 const ROOT = fileURLToPath(new URL(".", import.meta.url))
 const ENGINE = join(ROOT, "skills", "paper-dual", "scripts", "engine.py")
 const resourceUri = "ui://paper-dual/main.html"
+const workbenchIcon = "data:image/png;base64," + (await readFile(new URL("./assets/icon.png", import.meta.url))).toString("base64")
 
 const pageScript = (await readFile(new URL("./app.js", import.meta.url), "utf8")).replaceAll("</script", "<\\/script")
 const html = (await readFile(new URL("./app.html", import.meta.url), "utf8")).replace("/* APP_SCRIPT */", () => pageScript)
@@ -76,10 +77,15 @@ async function tempEdits(edits) {
   return { dir, file }
 }
 const ok = (structured, text) => ({ content: [{ type: "text", text }], structuredContent: structured })
-const fail = msg => ({ isError: true, content: [{ type: "text", text: msg }] })
-const brief = j => j.ok
-  ? (j.verdict ? `第 ${j.round} 轮 ${j.verdict}；通过 ${j.passed_count ?? 0} 段。` : (j.error ? j.error : "完成。"))
-  : (j.error || "操作失败")
+const fail = (msg, structured) => ({ isError: true, content: [{ type: "text", text: msg }], ...(structured ? { structuredContent: structured } : {}) })
+const brief = j => {
+  if (j.verdict) {
+    const state = j.check_status === "not_passed" ? "未通过，已回退" : j.verdict === "rejected" ? "拒绝，基础稿不变" : j.partial ? "通过（部分完成）" : "通过"
+    return `第 ${j.round} 轮${state}；门禁通过 ${j.passed_count ?? 0} 段，被拒 ${j.rejected_count ?? 0} 段。`
+  }
+  if (j.check_status) return j.check_status === "passed" ? `预检通过：${j.passed_count ?? 0} 段。` : `预检${j.check_status === "rejected" ? "拒绝" : "未通过"}：被拒 ${j.rejected_count ?? 0} 段。`
+  return j.ok ? "完成。" : (j.error || "操作失败")
+}
 
 // ---- tools ----------------------------------------------------------------
 
@@ -89,6 +95,7 @@ const tools = [
   { name: "open_workbench", title: "论文双降工作台", description: "打开论文双降工作台页面并读取当前状态（可传 path 定位文档）。",
     inputSchema: { type: "object", properties: { ...pathProp }, additionalProperties: false },
     annotations: { readOnlyHint: true },
+    icons: [{ src: workbenchIcon, mimeType: "image/png" }],
     _meta: { ui: { resourceUri }, "qoder/ui": { entrypoints: [{ type: "global" }, { type: "thread" }] } } },
   { name: "paper_dual_status", title: "查询双降状态", description: "查询某篇论文的诊断/轮次/基础稿状态；不传 path 则列出最近 12 篇文档。",
     inputSchema: { type: "object", properties: { ...pathProp }, additionalProperties: false },
@@ -102,8 +109,8 @@ const tools = [
   { name: "paper_dual_lint", title: "预检改写清单", description: "对 edits.jsonl 逐段跑门禁。可传 edits 数组（{pid,text,op}）直接预检，否则用状态目录内清单。",
     inputSchema: { type: "object", properties: { ...pathProp, edits: { type: "array", items: { type: "object" } } }, required: ["path"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false } },
-  { name: "paper_dual_apply_edits", title: "回填并复检", description: "写入清单→门禁→保形回填→篇级复检；恶化整篇回退。可传 edits 数组，否则用状态目录内清单。",
-    inputSchema: { type: "object", properties: { ...pathProp, edits: { type: "array", items: { type: "object" } } }, required: ["path"], additionalProperties: false },
+  { name: "paper_dual_apply_edits", title: "回填并复检", description: "写入清单→门禁→保形回填→篇级复检；恶化整篇回退。默认要求本轮任务全部通过；allowPartial=true 时明确允许跳过被拒或未提交段。",
+    inputSchema: { type: "object", properties: { ...pathProp, edits: { type: "array", items: { type: "object" } }, allowPartial: { type: "boolean", description: "明确允许部分完成；默认 false" } }, required: ["path"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false } },
   { name: "pd_save_edits", title: "保存清单（页面）", description: "页面粘贴的 JSONL 文本校验后保存到状态目录。",
     inputSchema: { type: "object", properties: { ...pathProp, jsonl: { type: "string" } }, required: ["path", "jsonl"], additionalProperties: false },
@@ -147,7 +154,8 @@ async function callTool(name, args) {
         const a = ["lint", "--path", path]
         if (args.edits) { tmp = await tempEdits(args.edits); a.push("--edits", tmp.file) }
         const j = await engine(a)
-        return ok(j, `预检：通过 ${j.passed_count ?? 0}，被拒 ${j.rejected_count ?? 0}。`)
+        const text = brief(j)
+        return j.ok ? ok(j, text) : fail(text, j)
       } finally { if (tmp) await rm(tmp.dir, { recursive: true, force: true }) }
     }
     case "paper_dual_apply_edits": {
@@ -159,8 +167,10 @@ async function callTool(name, args) {
           const sv = await engine(["save-edits", "--path", path, "--file", tmp.file])
           if (!sv.ok) return fail(sv.error || "清单保存失败")
         }
-        const j = await engine(["finish", "--path", path])
-        return ok(j, brief(j))
+        const a = ["finish", "--path", path]
+        if (args.allowPartial === true) a.push("--allow-partial")
+        const j = await engine(a)
+        return j.verdict === "rejected" ? fail(brief(j), j) : ok(j, brief(j))
       } finally { if (tmp) await rm(tmp.dir, { recursive: true, force: true }) }
     }
     case "pd_save_edits": {
@@ -200,7 +210,8 @@ async function callTool(name, args) {
       const rd = join(st.state_dir, "rounds", `r${n}`)
       const comparison = JSON.parse(await readFile(join(rd, "comparison.json"), "utf8"))
       const report = await readFile(join(rd, "report.md"), "utf8")
-      return ok({ round: n, comparison, report, reportPath: join(rd, "report.md") }, `第 ${n} 轮对照与报告`)
+      return ok({ round: n, comparison, report, reportPath: join(rd, "report.md"),
+        reportDownload: { filename: `report-r${n}.md`, mimeType: "text/markdown", text: report } }, `第 ${n} 轮对照与报告`)
     }
     case "pd_get_file": {
       const path = validPath(args.path)
@@ -241,7 +252,7 @@ async function handle(request) {
         return reply({ id, result: {
           protocolVersion: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"].includes(params.protocolVersion) ? params.protocolVersion : "2025-11-25",
           capabilities: { tools: {}, resources: {} },
-          serverInfo: { name: "paper-dual-qoder", version: "0.1.0" },
+          serverInfo: { name: "paper-dual-qoder", version: "0.2.1" },
         } })
       case "ping": return reply({ id, result: {} })
       case "tools/list": return reply({ id, result: { tools } })

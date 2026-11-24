@@ -14,21 +14,29 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 
-ENGINE_VERSION = "0.1.0"
+ENGINE_VERSION = "0.2.1"
 MAX_ROUNDS = 5
 MIN_PARA_CHARS = 20
 FINGERPRINT = 13
 REPEAT_TASK_RATIO = 0.20
 REPEAT_O9_RATIO = 0.45
+REPEAT_ACCEPT_TOLERANCE = 0.002
 LENGTH_LO, LENGTH_HI = 0.55, 1.40
-BIGRAM_MIN = 0.30
+BIGRAM_MIN = 0.40
 HIGH_SCORE, MID_SCORE = 6, 3
 ROUND_CAPS = {"dual": [16, 10, 6, 4, 2], "aigc": [12, 8, 5, 3, 2], "dedup": [16, 10, 6, 4, 2]}
+MAX_ZIP_ENTRIES = 10000
+MAX_ZIP_TOTAL = 256 * 1024 * 1024
+MAX_XML_BYTES = 64 * 1024 * 1024
+STATE_LOCK_TIMEOUT = 180
 MODE_NAMES = {"dedup": "降低篇内重复率", "aigc": "降低 AI 疑似占比（离线痕迹口径）", "dual": "双降"}
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -59,7 +67,7 @@ HEADING_STYLE = re.compile(r"^(heading\s*[1-9]|标题\s*[1-9]?|title|subtitle)$"
 REFS_HEAD = re.compile(r"参考文献|参考书目|References", re.I)
 APPENDIX_HEAD = re.compile(r"附\s*录|Appendix", re.I)
 
-NEG_RE = re.compile(r"不|没|未|无(?!论|线|限|数|穷|奈|辜|私|畏|端|偿|微不至)")
+NEG_RE = re.compile(r"并未|并非|不是|不能|不会|不可|不应|不得|不再|从未|决不|绝不|没有|没能|未能|否认|缺乏|缺少|忽略|避免|防止|未|没|无(?!论|线|限|数|穷|奈|辜|私|畏|端|偿|微不至)|不(?!断|时|久|宜|妨|免|知|见得|得已|小心|由自主|约而同)")
 SUBJ_RE = re.compile(r"我觉得|我认为|笔者觉得|个人认为|我们觉得")
 NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
 CITE_RE = re.compile(r"\[\d+(?:[-–,，]\d+)*\]")
@@ -125,6 +133,7 @@ def para_sig(p) -> str:
     clone = ET.fromstring(ET.tostring(p))
     for t in clone.iter(W + "t"):
         t.text = ""
+        t.attrib.pop(XML_SPACE, None)
     return canon(clone)
 
 
@@ -147,12 +156,38 @@ class Paragraph:
         self.norm = norm(text)
 
 
+def validate_zip_budget(z: zipfile.ZipFile) -> None:
+    infos = z.infolist()
+    if len(infos) > MAX_ZIP_ENTRIES:
+        raise ValueError(f"DOCX 条目数超过预算：{len(infos)} > {MAX_ZIP_ENTRIES}")
+    total = sum(i.file_size for i in infos)
+    if total > MAX_ZIP_TOTAL:
+        raise ValueError(f"DOCX 解压后体积超过预算：{total} > {MAX_ZIP_TOTAL}")
+    doc = z.getinfo("word/document.xml")
+    if doc.file_size > MAX_XML_BYTES:
+        raise ValueError(f"document.xml 超过预算：{doc.file_size} > {MAX_XML_BYTES}")
+
+
 class Docx:
     def __init__(self, path: Path):
         self.path = path
+        self.styles: dict[str, tuple[str, str]] = {}
         with zipfile.ZipFile(path) as z:
+            validate_zip_budget(z)
             self.xml = z.read("word/document.xml").decode("utf-8")
             self.names = z.namelist()
+            if "word/styles.xml" in self.names:
+                styles_xml = z.read("word/styles.xml")
+                if len(styles_xml) > MAX_XML_BYTES:
+                    raise ValueError(f"styles.xml 超过预算：{len(styles_xml)} > {MAX_XML_BYTES}")
+                styles_root = ET.fromstring(styles_xml)
+                for st in styles_root.findall(W + "style"):
+                    sid = st.get(W + "styleId", "")
+                    name_el = st.find(W + "name")
+                    based_el = st.find(W + "basedOn")
+                    if sid:
+                        self.styles[sid] = (name_el.get(W + "val", "") if name_el is not None else "",
+                                            based_el.get(W + "val", "") if based_el is not None else "")
         self.root = ET.fromstring(self.xml)
         self.body = self.root.find(W + "body")
         if self.body is None:
@@ -171,8 +206,25 @@ class Docx:
             else:
                 yield from self._walk(child, in_table, in_p)
 
+    def _style_chain(self, style: str):
+        seen = set()
+        sid = style
+        while sid and sid not in seen:
+            seen.add(sid)
+            name, sid = self.styles.get(sid, ("", ""))
+            yield name
+
+    def _is_heading(self, style: str, pPr) -> bool:
+        if pPr is not None and pPr.find(W + "outlineLvl") is not None:
+            return True
+        return bool(style and (HEADING_STYLE.match(style) or any(HEADING_STYLE.match(n) for n in self._style_chain(style))))
+
+    def _style_names(self, style: str) -> set[str]:
+        return {style.lower(), *(n.lower() for n in self._style_chain(style))}
+
     def _parse(self):
         refs = appendix = False
+        region_level = 0
         for i, (el, in_table) in enumerate(self._walk(self.body, False, False)):
             pid = f"p{i:04d}"
             text = para_text(el)
@@ -180,16 +232,35 @@ class Docx:
             pPr = el.find(W + "pPr")
             style_el = pPr.find(W + "pStyle") if pPr is not None else None
             style = style_el.get(W + "val") if style_el is not None else ""
-            is_heading = bool(style and HEADING_STYLE.match(style)) or (
-                pPr is not None and pPr.find(W + "outlineLvl") is not None)
-            if is_heading:
-                if REFS_HEAD.search(text):
-                    refs, appendix = True, False
-                elif APPENDIX_HEAD.search(text):
-                    refs, appendix = False, True
-                else:
-                    refs = appendix = False
+            clean = norm(text)
+            is_region_head = bool(re.fullmatch(r"(参考文献|参考书目|References|附录|Appendix)", clean, re.I))
+            level = self._heading_level(style, pPr)
+            if is_region_head or level:
+                level = level or 1
+                if REFS_HEAD.fullmatch(clean) or (not is_region_head and REFS_HEAD.search(text)):
+                    refs, appendix, region_level = True, False, level
+                elif APPENDIX_HEAD.fullmatch(clean) or (not is_region_head and APPENDIX_HEAD.search(text)):
+                    refs, appendix, region_level = False, True, level
+                elif refs or appendix:
+                    if level <= region_level:
+                        refs = appendix = region_level = False
+                if "标题" not in reasons:
+                    reasons.append("标题")
             self.paras.append(Paragraph(pid, el, text, in_table, bool(reasons), reasons, para_sig(el)))
+
+    def _heading_level(self, style: str, pPr) -> int:
+        outline = pPr.find(W + "outlineLvl") if pPr is not None else None
+        if outline is not None:
+            try:
+                return int(outline.get(W + "val", "0")) + 1
+            except ValueError:
+                pass
+        names = [style, *self._style_chain(style)]
+        for name in names:
+            m = re.search(r"(?:heading|标题)\s*([1-9])", name, re.I)
+            if m:
+                return int(m.group(1))
+        return 1 if self._is_heading(style, pPr) else 0
 
     def _classify(self, el, in_table, text, refs, appendix) -> list[str]:
         r = []
@@ -198,8 +269,10 @@ class Docx:
         pPr = el.find(W + "pPr")
         style_el = pPr.find(W + "pStyle") if pPr is not None else None
         style = style_el.get(W + "val") if style_el is not None else ""
-        if (style and HEADING_STYLE.match(style)) or (pPr is not None and pPr.find(W + "outlineLvl") is not None):
+        if self._is_heading(style, pPr):
             r.append("标题")
+        if style and style not in self.styles:
+            r.append("未知样式")
         if refs:
             r.append("参考文献")
         if appendix:
@@ -214,7 +287,7 @@ class Docx:
             r.append("引用链接")
         if next(el.iter(W + "drawing"), None) is not None or next(el.iter(W + "pict"), None) is not None or next(el.iter(W + "object"), None) is not None:
             r.append("图形/文本框")
-        is_code = style.lower() in {"code", "代码", "htmlcode", "verbatimchar"}
+        is_code = bool(self._style_names(style) & {"code", "代码", "htmlcode", "verbatimchar"})
         for rp in el.iter(W + "rPr"):
             fonts = rp.find(W + "rFonts")
             if fonts is not None:
@@ -225,7 +298,9 @@ class Docx:
             r.append("代码")
         if next(el.iter(W + "tab"), None) is not None or next(el.iter(W + "br"), None) is not None:
             r.append("制表/换行")
-        runs = [run for run in el.findall(W + "r") if run.find(W + "t") is not None]
+        if any(next(el.iter(tag), None) is not None for tag in (W + "smartTag", W + "customXml", W + "sdt")):
+            r.append("嵌套文本容器")
+        runs = [run for run in el.iter(W + "r") if run.find(W + "t") is not None]
         if not runs or len(norm(text)) < MIN_PARA_CHARS:
             r.append("过短")
         elif len({canon(run.find(W + "rPr")) for run in runs}) > 1:
@@ -276,7 +351,7 @@ class Docx:
                     tag = m.group(1)
                     if first:
                         first = False
-                        if "xml:space" not in tag:
+                        if "xml:space" not in tag and (new[:1].isspace() or new[-1:].isspace()):
                             tag = tag[:-1] + ' xml:space="preserve">'
                         return tag + escape_xml(new) + m.group(3)
                     return tag + m.group(3)
@@ -288,7 +363,10 @@ class Docx:
         return "".join(out).encode("utf-8")
 
     def save(self, new_xml: bytes, dest: Path) -> None:
+        if len(new_xml) > MAX_XML_BYTES:
+            raise ValueError(f"document.xml 超过预算：{len(new_xml)} > {MAX_XML_BYTES}")
         with zipfile.ZipFile(self.path) as zin, zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zout:
+            validate_zip_budget(zin)
             for item in zin.infolist():
                 data = new_xml if item.filename == "word/document.xml" else zin.read(item.filename)
                 zout.writestr(item, data)
@@ -448,9 +526,11 @@ def diagnose_paras(paras: list[Paragraph], dedup: dict) -> dict:
 
 # ---------------------------------------------------------------- 门禁
 
-def entities(text: str) -> dict[str, set]:
-    return {"数字": set(NUM_RE.findall(text)), "引用": set(CITE_RE.findall(text)),
-            "书名": set(BOOK_RE.findall(text)), "缩写": set(ABBR_RE.findall(text))}
+def entities(text: str) -> dict[str, Counter]:
+    return {"数字": Counter(NUM_RE.findall(text)),
+            "引用": Counter(CITE_RE.findall(text)),
+            "书名": Counter(BOOK_RE.findall(text)),
+            "缩写": Counter(ABBR_RE.findall(text))}
 
 
 def neg_count(text: str) -> int:
@@ -479,7 +559,7 @@ def lint_edit(p: Paragraph, new_text: str, op: str) -> list[dict]:
     for kind in old_e:
         missing, added = old_e[kind] - new_e[kind], new_e[kind] - old_e[kind]
         if missing or added:
-            fails.append({"gate": "实体", "detail": f"{kind}不一致：丢失 {sorted(missing) or '无'}，新增 {sorted(added) or '无'}"})
+            fails.append({"gate": "实体", "detail": f"{kind}次数不一致：丢失 {dict(missing) or '无'}，新增 {dict(added) or '无'}"})
     if len(SUBJ_RE.findall(new_text)) > len(SUBJ_RE.findall(p.text)):
         fails.append({"gate": "主观表述", "detail": "「我觉得/我认为」类表述增多"})
     ratio = vis_len(new_text) / max(vis_len(p.text), 1)
@@ -488,9 +568,19 @@ def lint_edit(p: Paragraph, new_text: str, op: str) -> list[dict]:
     ov = bigram_overlap(p.norm, norm(new_text))
     if ov < BIGRAM_MIN:
         fails.append({"gate": "语义代理", "detail": f"字二元组重合度 {ov:.2f} < {BIGRAM_MIN}，疑似换内容而非换说法"})
-    if neg_count(new_text) != neg_count(p.text):
-        fails.append({"gate": "语义代理", "detail": f"否定词计数 {neg_count(p.text)} → {neg_count(new_text)}，须守恒"})
+    if bool(NEG_RE.search(p.text)) != bool(NEG_RE.search(new_text)):
+        fails.append({"gate": "语义代理", "detail": "显式否定表述增加或消失；请人工核对否定范围与论断强度"})
     return fails
+
+
+def repeat_acceptable(before: float, after: float) -> bool:
+    return after <= before + REPEAT_ACCEPT_TOLERANCE
+
+
+def check_state(ok: bool, invalid_input: bool = False) -> str:
+    if ok:
+        return "passed"
+    return "rejected" if invalid_input else "not_passed"
 
 
 def read_edits(path: Path) -> tuple[list[dict], list[str]]:
@@ -542,10 +632,67 @@ def load_state(d: Path) -> dict:
     return json.loads(f.read_text(encoding="utf-8"))
 
 
+@contextmanager
+def state_lock(path: Path, timeout: int = STATE_LOCK_TIMEOUT):
+    locks = state_root() / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    lock_path = locks / f"{doc_key(path)}.lock"
+    f = lock_path.open("a+b")
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                f.write(b"\0")
+                f.flush()
+            f.seek(0)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        die("另一进程正在处理该文档，请稍后重试", busy=True)
+                    time.sleep(0.1)
+        else:
+            import fcntl
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        die("另一进程正在处理该文档，请稍后重试", busy=True)
+                    time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
 def save_state(d: Path, state: dict) -> None:
-    tmp = d / "state.json.tmp"
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(d / "state.json")
+    fd, name = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=d)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / "state.json")
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def check_source(state: dict) -> None:
@@ -556,11 +703,11 @@ def check_source(state: dict) -> None:
         die("原文在诊断后被修改，旧产物不再可信；请重新运行 diagnose（旧产物会自动归档）", blocked=True)
 
 
-def base_info(state: dict) -> tuple[Path, dict]:
+def base_info(state: dict, d: Path) -> tuple[Path, dict]:
     for r in reversed(state["rounds"]):
         if r["status"] == "accepted":
-            return Path(r["docx"]), r["metrics_after"]
-    return Path(state["original_docx"]), state["base_metrics"]
+            return d / "rounds" / f"r{r['n']}" / "accepted.docx", r["metrics_after"]
+    return d / "original.docx", state["base_metrics"]
 
 
 def metrics_of(doc: Docx) -> tuple[dict, dict, dict]:
@@ -585,7 +732,12 @@ def cmd_doctor(_args) -> None:
         writable = True
     except OSError:
         writable = False
-    aigc = {"available": False, "note": "v0.1 为离线核心；真机 AIGC 检测（torch+transformers）计划在后续版本提供"}
+    configured_model = os.environ.get("PAPER_DUAL_AIGC_MODEL", "").strip()
+    aigc = {"available": False, "status": "not_configured", "configured": False,
+            "note": "未配置真机 AIGC 检测器；当前只运行离线痕迹诊断，不产生模型检测概率。"}
+    if configured_model:
+        aigc.update(status="configuration_error", configured=True,
+                    note="已设置 PAPER_DUAL_AIGC_MODEL，但当前 v0.2.x 尚未接入模型推理；请取消该配置或升级引擎，离线诊断不受影响。")
     emit({"ok": True, "engine_version": ENGINE_VERSION, "python": sys.version.split()[0],
           "python_ok": sys.version_info >= (3, 10), "state_dir": str(root), "writable": writable,
           "aigc": aigc, "max_rounds": MAX_ROUNDS})
@@ -600,32 +752,46 @@ def cmd_diagnose(args) -> None:
     if path.suffix.lower() != ".docx":
         die("只支持 .docx 文件")
     d = doc_dir(path)
-    if (d / "state.json").exists():
-        archive = state_root() / "archive" / f"{d.name}-{time.strftime('%Y%m%d%H%M%S')}"
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(d), str(archive))
-    d.mkdir(parents=True, exist_ok=True)
-    snap = d / "original.docx"
-    shutil.copy2(path, snap)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{d.name}-", dir=d.parent))
     try:
-        doc = Docx(snap)
-    except (zipfile.BadZipFile, KeyError, ValueError, ET.ParseError) as e:
-        die(f"无法解析 docx：{e}")
-    m, dd, risk = metrics_of(doc)
-    locked_reasons: dict[str, int] = {}
-    for p in doc.paras:
-        for r in p.reasons:
-            locked_reasons[r] = locked_reasons.get(r, 0) + 1
-    diagnosis = {"doc": {"path": str(path), "name": path.name, "hash": sha256_file(path),
-                         "paragraphs": len(doc.paras), "rewritable": m["rewritable"],
-                         "locked": len(doc.paras) - m["rewritable"], "locked_reasons": locked_reasons},
-                 "repeat": {k: dd[k] for k in ("rate", "covered_chars", "total_chars", "top")},
-                 "risk": {k: risk[k] for k in ("high", "mid", "low", "total_score", "dims", "top")}}
-    (d / "diagnosis.json").write_text(json.dumps(diagnosis, ensure_ascii=False, indent=1), encoding="utf-8")
-    state = {"engine_version": ENGINE_VERSION, "doc_path": str(path), "doc_hash": diagnosis["doc"]["hash"],
-             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "original_docx": str(snap),
-             "base_metrics": m, "rounds": []}
-    save_state(d, state)
+        snap = stage / "original.docx"
+        try:
+            shutil.copy2(path, snap)
+            doc = Docx(snap)
+        except (zipfile.BadZipFile, KeyError, ValueError, ET.ParseError, OSError) as e:
+            die(f"无法解析 docx：{e}")
+        m, dd, risk = metrics_of(doc)
+        locked_reasons: dict[str, int] = {}
+        for p in doc.paras:
+            for r in p.reasons:
+                locked_reasons[r] = locked_reasons.get(r, 0) + 1
+        diagnosis = {"doc": {"path": str(path), "name": path.name, "hash": sha256_file(path),
+                             "paragraphs": len(doc.paras), "rewritable": m["rewritable"],
+                             "locked": len(doc.paras) - m["rewritable"], "locked_reasons": locked_reasons},
+                     "repeat": {k: dd[k] for k in ("rate", "covered_chars", "total_chars", "top")},
+                     "risk": {k: risk[k] for k in ("high", "mid", "low", "total_score", "dims", "top")}}
+        (stage / "diagnosis.json").write_text(json.dumps(diagnosis, ensure_ascii=False, indent=1), encoding="utf-8")
+        state = {"engine_version": ENGINE_VERSION, "doc_path": str(path), "doc_hash": diagnosis["doc"]["hash"],
+                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "original_docx": str(d / "original.docx"),
+                 "base_metrics": m, "rounds": []}
+        save_state(stage, state)
+        archive = None
+        if d.exists():
+            archive = state_root() / "archive" / f"{d.name}-{time.strftime('%Y%m%d%H%M%S')}-{time.time_ns()}"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(d), str(archive))
+        try:
+            stage.replace(d)
+        except OSError:
+            if archive is not None and not d.exists():
+                shutil.move(str(archive), str(d))
+            raise
+    except OSError as e:
+        die(f"诊断状态切换失败：{e}")
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
     emit({"ok": True, "state_dir": str(d), **diagnosis,
           "next": "rewrite --mode dual|aigc|dedup（生成改写任务）"})
 
@@ -642,7 +808,7 @@ def cmd_rewrite(args) -> None:
         die("style 必须是 plain / academic")
     if len(state["rounds"]) >= MAX_ROUNDS:
         die(f"已达五改上限（{MAX_ROUNDS} 轮），请作者复核现有版本后手动定稿", capped=True)
-    base_path, base_m = base_info(state)
+    base_path, base_m = base_info(state, d)
     doc = Docx(base_path)
     dd = dedup_analysis(doc.paras)
     risk = diagnose_paras(doc.paras, dd)
@@ -703,7 +869,7 @@ def cmd_rewrite(args) -> None:
                         "risk_score": score, "repeat_ratio": ratio,
                         "requirements": reqs, "style_rules": rules,
                         "constraints": {"length_ratio": [LENGTH_LO, LENGTH_HI],
-                                        "entities": "数字/引用/书名/缩写集合必须与原文完全一致",
+                                        "entities": "数字/引用/书名/缩写及其出现次数必须与原文完全一致",
                                         "negation": "否定词语义守恒", "no_new_facts": True}})
     pf = rd / "prompts.jsonl"
     pf.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in prompts), encoding="utf-8")
@@ -711,7 +877,7 @@ def cmd_rewrite(args) -> None:
               f"逐条读取 prompts.jsonl，每行改写一段，输出 edits.jsonl：一行一条 "
               f'{{"pid","text","op"}}，op 取该条 ops 中最主要的一个。\n\n'
               "硬性约束：\n" + "".join(f"- {r}\n" for r in rules) +
-              f"- 字数 ∈ 原文 × [{LENGTH_LO}, {LENGTH_HI}]；数字/年份/引用/书名/缩写集合完全一致；否定语义守恒。\n"
+              f"- 字数 ∈ 原文 × [{LENGTH_LO}, {LENGTH_HI}]；数字/年份/引用/书名/缩写及次数完全一致；不得增删显式否定，改写后请核对否定范围。\n"
               "- 只改正文；标题、表格、代码、公式、脚注、参考文献一律不动；不新增事实与主观表述。\n"
               "- 总字数控制在原文 ±20% 以内。\n\n"
               "边界：本工具分数为篇内相对指标，不等同任何检测平台判定；改稿必须由作者复核。\n")
@@ -756,11 +922,12 @@ def cmd_lint(args) -> None:
     if not edits_path.exists():
         die(f"清单不存在：{edits_path}；请先写入 edits.jsonl", needEdits=True)
     rows, errors = read_edits(edits_path)
-    base_path, _ = base_info(state)
+    base_path, _ = base_info(state, d)
     doc = Docx(base_path)
     by = doc.by_pid()
     task_pids = {t["pid"] for t in rnd["tasks"]}
     passed, rejected = [], []
+    submitted = {row["pid"] for row in rows}
     for row in rows:
         pid = row["pid"]
         if pid not in by:
@@ -774,7 +941,11 @@ def cmd_lint(args) -> None:
             rejected.append({"pid": pid, "gates": fails})
         else:
             passed.append(pid)
-    result = {"ok": not errors and not rejected, "round": rnd["n"], "errors": errors,
+    for pid in sorted(task_pids - submitted):
+        rejected.append({"pid": pid, "gates": [{"gate": "任务覆盖", "detail": "本轮任务未提交"}]})
+    passed_all = not errors and not rejected
+    result = {"ok": passed_all, "check_status": check_state(passed_all, bool(errors)),
+              "round": rnd["n"], "errors": errors,
               "passed": passed, "rejected": rejected,
               "passed_count": len(passed), "rejected_count": len(rejected)}
     lp = d / "rounds" / f"r{rnd['n']}" / "lint.json"
@@ -783,6 +954,8 @@ def cmd_lint(args) -> None:
     result["lint_path"] = str(lp)
     result["next"] = "finish 回填并复检" if result["ok"] else "按 rejected 中的门禁原因修正清单后重新 lint"
     emit(result)
+    if not result["ok"]:
+        sys.exit(2)
 
 
 def cmd_finish(args) -> None:
@@ -798,11 +971,12 @@ def cmd_finish(args) -> None:
     if not edits_path.exists():
         die(f"清单不存在：{edits_path}", needEdits=True)
     rows, errors = read_edits(edits_path)
-    base_path, base_m = base_info(state)
+    base_path, base_m = base_info(state, d)
     base = Docx(base_path)
     by = base.by_pid()
     task_pids = {t["pid"] for t in rnd["tasks"]}
     passed, rejected, edits = [], [], {}
+    submitted = {row["pid"] for row in rows}
     for row in rows:
         pid = row["pid"]
         if pid not in by or pid not in task_pids:
@@ -814,21 +988,34 @@ def cmd_finish(args) -> None:
         else:
             passed.append(pid)
             edits[pid] = row["text"]
+    for pid in sorted(task_pids - submitted):
+        rejected.append({"pid": pid, "gates": [{"gate": "任务覆盖", "detail": "本轮任务未提交"}]})
     shutil.copy2(edits_path, rd / "edits.jsonl")
     reasons = []
     verdict = "rejected"
     after_m = None
     docx_out = None
+    candidate_checked = False
+    incomplete = bool(errors or rejected or set(passed) != task_pids)
     if errors:
         reasons.append("清单含非法行：" + "；".join(errors[:5]))
+    if incomplete and not args.allow_partial:
+        missing = sorted(task_pids - submitted)
+        reasons.append(f"本轮 {len(task_pids)} 个任务未全部通过（未提交 {len(missing)} 段，被拒 {len(rejected)} 段）；"
+                       "如确认跳过这些段，请明确使用 --allow-partial")
     if not edits:
         reasons.append("没有任何通过门禁的改写，未生成改稿")
+    elif errors:
+        pass
+    elif incomplete and not args.allow_partial:
+        pass
     else:
         try:
             new_xml = base.apply_edits(edits)
             cand = rd / "candidate.docx"
             base.save(new_xml, cand)
             out = Docx(cand)
+            candidate_checked = True
             if len(out.paras) != len(base.paras):
                 reasons.append("篇级复检失败：段落数量变化，整篇回退")
             else:
@@ -845,14 +1032,12 @@ def cmd_finish(args) -> None:
                 after_m, _, _ = metrics_of(out)
                 mode = rnd["mode"]
 
-                def worse_or_flat(before, after):
-                    return after > before or (before > 0 and after >= before)
-
-                if mode in ("dedup", "dual") and worse_or_flat(base_m["repeat_rate"], after_m["repeat_rate"]):
-                    reasons.append(f"篇内重复率未下降（{base_m['repeat_rate']:.2%} → {after_m['repeat_rate']:.2%}），整篇回退")
+                if mode in ("dedup", "dual") and not repeat_acceptable(base_m["repeat_rate"], after_m["repeat_rate"]):
+                    reasons.append(f"篇内重复率上升超过 {REPEAT_ACCEPT_TOLERANCE:.1%} 容忍值"
+                                   f"（{base_m['repeat_rate']:.2%} → {after_m['repeat_rate']:.2%}），整篇回退")
                 if mode in ("aigc", "dual"):
-                    if worse_or_flat(base_m["risk_total"], after_m["risk_total"]):
-                        reasons.append(f"痕迹风险分未下降（{base_m['risk_total']} → {after_m['risk_total']}），整篇回退")
+                    if after_m["risk_total"] > base_m["risk_total"]:
+                        reasons.append(f"痕迹风险分上升（{base_m['risk_total']} → {after_m['risk_total']}），整篇回退")
                     if after_m["high"] > base_m["high"]:
                         reasons.append(f"高风险段数上升（{base_m['high']} → {after_m['high']}），整篇回退")
                 if not reasons:
@@ -863,8 +1048,10 @@ def cmd_finish(args) -> None:
                     cand.replace(rd / "rejected.docx")
         except ValueError as e:
             reasons.append(str(e))
-    rnd.update(status=verdict, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-               passed=passed, rejected=rejected, reasons=reasons,
+    partial = verdict == "accepted" and incomplete
+    status = check_state(verdict == "accepted", bool(errors or (incomplete and not args.allow_partial) or not edits) or not candidate_checked)
+    rnd.update(status=verdict, check_status=status, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+               passed=passed, rejected=rejected, reasons=reasons, partial=partial,
                metrics_after=after_m, docx=str(docx_out) if docx_out else None)
     rows_cmp = []
     for pid in passed:
@@ -873,6 +1060,7 @@ def cmd_finish(args) -> None:
                          "old_len": vis_len(old), "new_len": vis_len(new),
                          "old_sents": len(sentences(old)), "new_sents": len(sentences(new))})
     comparison = {"round": rnd["n"], "mode": rnd["mode"], "verdict": verdict,
+                  "check_status": status, "partial": partial,
                   "metrics_before": base_m, "metrics_after": after_m,
                   "rows": rows_cmp, "rejected": rejected, "reasons": reasons}
     (rd / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -881,7 +1069,8 @@ def cmd_finish(args) -> None:
     if verdict == "accepted":
         state["base_metrics"] = after_m
     save_state(d, state)
-    emit({"ok": verdict == "accepted", "verdict": verdict, "round": rnd["n"], "mode": rnd["mode"],
+    emit({"ok": verdict == "accepted", "verdict": verdict, "check_status": status,
+          "partial": partial, "round": rnd["n"], "mode": rnd["mode"],
           "passed_count": len(passed), "rejected_count": len(rejected), "reasons": reasons,
           "metrics_before": base_m, "metrics_after": after_m,
           "docx": str(docx_out) if docx_out else None,
@@ -889,20 +1078,26 @@ def cmd_finish(args) -> None:
           "state_dir": str(d),
           "next": "作者复核改稿；如需继续，rewrite 生成下一轮（最多五改）" if verdict == "accepted"
                   else "按 reasons 修正后重新 rewrite/lint/finish"})
+    if verdict != "accepted":
+        sys.exit(2)
 
 
 def build_report(state: dict, rnd: dict, cmp: dict) -> str:
     mb, ma = cmp["metrics_before"], cmp["metrics_after"]
+    verdict_text = ("通过（部分完成，已跳过未通过/未提交段）" if cmp.get("partial")
+                    else "通过（accepted）" if rnd["status"] == "accepted"
+                    else "未通过（候选稿篇级复检未过，已回退）" if cmp.get("check_status") == "not_passed"
+                    else "拒绝（输入或任务集不合格，未回填；基础稿不变）")
     lines = [f"# 论文双降报告 · 第 {rnd['n']} 轮 · {MODE_NAMES[rnd['mode']]}",
-             "", f"- 文档：{state['doc_path']}", f"- 判定：**{'通过（accepted）' if rnd['status'] == 'accepted' else '拒绝（rejected，已回退）'}**",
+             "", f"- 文档：{state['doc_path']}", f"- 判定：**{verdict_text}**",
              f"- 通过门禁改写：{len(cmp['rows'])} 段；被拒：{len(cmp['rejected'])} 段", ""]
     if cmp["reasons"]:
-        lines += ["## 拒绝原因", ""] + [f"- {r}" for r in cmp["reasons"]] + [""]
+        lines += ["## 未通过 / 拒绝原因", ""] + [f"- {r}" for r in cmp["reasons"]] + [""]
     lines += ["## 指标前后对比", "", "| 指标 | 基础稿 | 改稿 |", "| --- | --- | --- |"]
     if ma:
         lines += [f"| 篇内重复率 | {mb['repeat_rate']:.2%} | {ma['repeat_rate']:.2%} |",
                   f"| 痕迹风险总分 | {mb['risk_total']} | {ma['risk_total']} |",
-                  f"| 高/中/低风险段 | {mb['high']}/{mb['mid']}/{mb['low']} | {ma['high']}/{ma['mid']}/{ma['low']} |"]
+                  f"| 高/中/低分段段数 | {mb['high']}/{mb['mid']}/{mb['low']} | {ma['high']}/{ma['mid']}/{ma['low']} |"]
     else:
         lines += [f"| 篇内重复率 | {mb['repeat_rate']:.2%} | — |",
                   f"| 痕迹风险总分 | {mb['risk_total']} | — |"]
@@ -917,8 +1112,10 @@ def build_report(state: dict, rnd: dict, cmp: dict) -> str:
             detail = "；".join(g["gate"] + "：" + g["detail"] for g in r["gates"])
             lines.append(f"- {r['pid']}：{detail}")
     lines += ["", "## 边界声明", "",
+              "- 早期说明中的 6 维是旧口径；当前诊断展示 9 个文风规则维度，用于定位改写目标，并非 9 个独立检测模型。",
               "- 风险分与重复率均为篇内相对指标，只用于同篇排序，跨文档不可比，不是任何平台的检测概率。",
-              "- 本工具不模拟知网/维普/格子达等平台，不承诺通过率；阈值仅用于定位改写目标。",
+              "- 本工具不模拟知网/维普/格子达等平台，不承诺通过率；门禁仅用于筛选候选稿，通过不等于原稿更优，请比较后替换。",
+              f"- 重复率验收容忍上升 {REPEAT_ACCEPT_TOLERANCE:.1%}（0.2 个百分点）；风险分持平可通过，上升则回退。",
               "- 标题、表格、代码、公式、脚注、参考文献一律未改；改稿必须由作者逐段复核。", ""]
     return "\n".join(lines)
 
@@ -931,10 +1128,14 @@ def cmd_status(args) -> None:
         state = load_state(d)
         src = Path(state["doc_path"])
         source_ok = src.exists() and sha256_file(src) == state["doc_hash"]
-        base_path, base_m = base_info(state)
+        base_path, base_m = base_info(state, d)
         emit({"ok": True, "state_dir": str(d), "doc_path": state["doc_path"],
               "source_unchanged": source_ok, "base": str(base_path), "base_metrics": base_m,
-              "rounds": [{k: r.get(k) for k in ("n", "mode", "style", "status", "passed", "reasons", "docx")}
+              "rounds": [{"n": r["n"], "mode": r.get("mode"), "style": r.get("style"),
+                          "status": r.get("status"), "check_status": r.get("check_status", "pending"),
+                          "partial": r.get("partial", False), "passed": r.get("passed", []),
+                          "reasons": r.get("reasons", []),
+                          "docx": str(d / "rounds" / f"r{r['n']}" / "accepted.docx") if r.get("docx") else None}
                          for r in state["rounds"]],
               "pending": bool(state["rounds"]) and state["rounds"][-1]["status"] == "awaiting_edits",
               "diagnosis": str(d / "diagnosis.json")})
@@ -969,17 +1170,24 @@ def main() -> None:
             p.add_argument("--style", default="plain")
         if name in ("lint", "finish"):
             p.add_argument("--edits", help="edits.jsonl 路径（默认状态目录内）")
+        if name == "finish":
+            p.add_argument("--allow-partial", action="store_true", help="明确允许跳过被拒或未提交的任务段")
         if name == "save-edits":
             p.add_argument("--file", required=True, help="待校验保存的 JSONL 文件")
     args = ap.parse_args()
-    if args.cmd != "doctor" and args.cmd != "status" and not args.path:
+    if args.cmd == "doctor":
+        cmd_doctor(args)
+        return
+    if args.cmd != "status" and not args.path:
         die("该子命令需要 --path")
     if args.cmd == "status" and not args.path:
         cmd_status(args)
         return
-    {"doctor": cmd_doctor, "diagnose": cmd_diagnose, "rewrite": cmd_rewrite,
-     "save-edits": cmd_save_edits, "lint": cmd_lint, "finish": cmd_finish,
-     "status": cmd_status}[args.cmd](args)
+    path = Path(args.path).expanduser().resolve()
+    with state_lock(path):
+        {"diagnose": cmd_diagnose, "rewrite": cmd_rewrite,
+         "save-edits": cmd_save_edits, "lint": cmd_lint, "finish": cmd_finish,
+         "status": cmd_status}[args.cmd](args)
 
 
 if __name__ == "__main__":

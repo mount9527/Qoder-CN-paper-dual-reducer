@@ -55,8 +55,8 @@ EDIT1 = ("人工智能技术快速发展之后，深度学习模型在图像识�
          "总的来看，本文提出一种改进方法，该方法具有实际价值。")
 EDIT2 = ("这类深度网络在图像识别任务中承担着关键角色。"
          "本研究将其用于文本分类。")
-EDIT3 = ("系统先采集数据，然后对数据进行清洗，最终输出结果。"
-         "效率提升的同时，成本也降了下来。")
+EDIT3 = ("系统首先采集数据，其次清洗数据，最后输出结果。"
+         "效率在一方面得到提升，成本在另一方面得以降低。")
 EDIT4 = "本实验于2020年完成，样本量为1500例，准确率达到92.5%，相关结论参见文献[12]。"
 
 
@@ -112,6 +112,59 @@ def make_fixture(path: Path) -> None:
         z.writestr("word/document.xml", doc)
 
 
+def make_localized_fixture(path: Path) -> None:
+    make_fixture(path)
+    with zipfile.ZipFile(path) as z:
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    styles = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="{WNS}">
+<w:style w:type="paragraph" w:styleId="1"><w:name w:val="heading 1"/></w:style>
+<w:style w:type="paragraph" w:styleId="2"><w:name w:val="Custom Title"/><w:basedOn w:val="1"/></w:style>
+</w:styles>'''
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in items:
+            if info.filename == "word/document.xml":
+                text = data.decode("utf-8")
+                text = text.replace('w:pStyle w:val="Heading1"', 'w:pStyle w:val="1"', 1)
+                text = text.replace('w:pStyle w:val="Heading1"', 'w:pStyle w:val="2"', 1)
+                data = text.encode("utf-8")
+            z.writestr(info, data)
+        z.writestr("word/styles.xml", styles)
+
+
+def make_unknown_style_fixture(path: Path) -> None:
+    make_fixture(path)
+    with zipfile.ZipFile(path) as z:
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in items:
+            if info.filename == "word/document.xml":
+                text = data.decode("utf-8").replace(p(BODY4), p(BODY4, style="GhostStyle"))
+                data = text.encode("utf-8")
+            z.writestr(info, data)
+
+
+def make_edge_fixture(path: Path) -> None:
+    make_fixture(path)
+    with zipfile.ZipFile(path) as z:
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    nested = (f'<w:p><w:smartTag><w:r><w:rPr><w:b/></w:rPr><w:t>{BODY4}</w:t></w:r>'
+              '<w:r><w:t>该段包含智能标签容器，必须保守锁定以避免格式丢失。</w:t></w:r></w:smartTag></w:p>')
+    manual_refs = ('<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>参考文献</w:t></w:r></w:p>'
+                   '<w:p><w:r><w:t>手动加粗标题下的文献条目也必须锁定，不能进入改写任务清单。</w:t></w:r></w:p>'
+                   '<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>中文文献</w:t></w:r></w:p>'
+                   '<w:p><w:r><w:t>子分类标题之后的文献条目同样必须保持锁定，不能被误判为新正文。</w:t></w:r></w:p>')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in items:
+            if info.filename == "word/document.xml":
+                text = data.decode("utf-8")
+                text = text.replace(p(BODY1), p(BODY1).replace(' xml:space="preserve"', ""), 1)
+                text = text.replace(p(BODY2), nested + p(BODY2), 1)
+                text = text.replace(p("参考文献", style="Heading1"), manual_refs, 1)
+                data = text.encode("utf-8")
+            z.writestr(info, data)
+
+
 def write_edits(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
 
@@ -124,7 +177,12 @@ def main() -> None:
     paper = tmp / "测试论文.docx"
     make_fixture(paper)
 
-    run("doctor", expect_ok=True)
+    doctor = run("doctor", expect_ok=True)
+    check("AIGC 未配置状态明确", doctor["aigc"]["status"] == "not_configured", str(doctor["aigc"]))
+    os.environ["PAPER_DUAL_AIGC_MODEL"] = "configured-but-unsupported"
+    configured = run("doctor", expect_ok=True)
+    del os.environ["PAPER_DUAL_AIGC_MODEL"]
+    check("AIGC 配置错误不与未配置混淆", configured["aigc"]["status"] == "configuration_error", str(configured["aigc"]))
     d = run("diagnose", "--path", str(paper), expect_ok=True)
     doc = d["doc"]
     check("诊断：段落总数 13", doc["paragraphs"] == 13, str(doc))
@@ -157,6 +215,32 @@ def main() -> None:
     sd = Path(d["state_dir"])
     sys.path.insert(0, str(HERE))
     import engine
+    check("实体校验保留重复次数", engine.entities("2020年与2021年")["数字"]["2020"] == 1
+          and engine.entities("2020年与2020年")["数字"]["2020"] == 2)
+    positive = engine.Paragraph("unit", None, "该模型不断进步，实验方法保持稳定。", False, False, [], "")
+    advanced = engine.Paragraph("unit", None, "该模型持续发展，实验方法保持稳定。", False, False, [], "")
+    check("普通副词不触发否定门禁", not any(g["gate"] == "语义代理" for g in engine.lint_edit(positive, advanced.text, "O8")))
+    negative = engine.Paragraph("unit", None, "该方法不成立，需要继续验证。", False, False, [], "")
+    affirmative = engine.Paragraph("unit", None, "该方法成立，需要继续验证。", False, False, [], "")
+    check("显式否定消失仍被拦截", any("显式否定" in g["detail"] for g in engine.lint_edit(negative, affirmative.text, "O8")))
+    loose = "系统先采集数据，然后对数据进行清洗，最终输出结果。效率提升的同时，成本也降了下来。"
+    loose_para = engine.Paragraph("unit", None, BODY3, False, False, [], "")
+    check("语义代理下限调整为 0.40", 0.30 < engine.bigram_overlap(engine.norm(BODY3), engine.norm(loose)) < engine.BIGRAM_MIN
+          and any(g["gate"] == "语义代理" for g in engine.lint_edit(loose_para, loose, "O1")))
+    check("重复率容忍 0.002 边界", engine.repeat_acceptable(0.5, 0.502) and engine.repeat_acceptable(0.0, 0.0)
+          and not engine.repeat_acceptable(0.5, 0.5021))
+    edge = tmp / "edge.docx"
+    make_edge_fixture(edge)
+    edge_doc = engine.Docx(edge)
+    edge_nested = next(p for p in edge_doc.paras if "智能标签" in p.text)
+    check("smartTag 嵌套文本保守锁定", edge_nested.locked and "嵌套文本容器" in edge_nested.reasons, str(edge_nested.reasons))
+    check("手动加粗参考文献标题生效", any("参考文献" in p.reasons for p in edge_doc.paras if "手动加粗标题下" in p.text))
+    check("文献子分类不解除锁定", any("参考文献" in p.reasons for p in edge_doc.paras if "子分类标题之后" in p.text))
+    edge_base = next(p for p in edge_doc.paras if p.text == BODY1)
+    edge_out = tmp / "edge-output.docx"
+    edge_doc.save(edge_doc.apply_edits({edge_base.pid: EDIT1}), edge_out)
+    edge_written = engine.Docx(edge_out)
+    check("无 xml:space 段落保形回填", all(edge_written.by_pid()[p.pid].sig == p.sig for p in edge_doc.paras))
     base = engine.Docx(sd / "original.docx")
     by = base.by_pid()
     for para in base.paras:
@@ -181,6 +265,9 @@ def main() -> None:
     ])
     lint2 = run("lint", "--path", str(paper), "--edits", str(badf))
     check("lint：坏清单全拒", lint2["passed_count"] == 0 and lint2["rejected_count"] == 4, str(lint2))
+    lint_proc = subprocess.run([sys.executable, str(ENGINE), "lint", "--path", str(paper), "--edits", str(badf)],
+                               capture_output=True, text=True, encoding="utf-8")
+    check("lint 失败返回非零退出码", lint_proc.returncode == 2, str(lint_proc.returncode))
     gates = {r["pid"]: {g["gate"] for g in r["gates"]} for r in lint2["rejected"]}
     check("反例：数字篡改被实体门禁拒", "实体" in gates[pid1])
     check("反例：语义代理拒", "语义代理" in gates[pid2])
@@ -196,6 +283,7 @@ def main() -> None:
 
     f = run("finish", "--path", str(paper), expect_ok=True)
     check("finish：判定 accepted", f["verdict"] == "accepted", str(f["reasons"]))
+    check("finish：三态为通过", f["check_status"] == "passed", str(f["check_status"]))
     check("finish：重复率下降", f["metrics_after"]["repeat_rate"] < f["metrics_before"]["repeat_rate"],
           f'{f["metrics_before"]["repeat_rate"]} -> {f["metrics_after"]["repeat_rate"]}')
     check("finish：风险分下降", f["metrics_after"]["risk_total"] < f["metrics_before"]["risk_total"])
@@ -214,16 +302,22 @@ def main() -> None:
     check("finish：三栏对照 3 行", len(cmp_data["rows"]) == 3)
 
     worse = tmp / "worse.jsonl"
-    write_edits(worse, [{"pid": pid1, "text": EDIT1 + "综上所述，该方法具有重要意义。", "op": "O5"}])
-    run("rewrite", "--path", str(paper), "--mode", "dual", expect_ok=True)
+    r2 = run("rewrite", "--path", str(paper), "--mode", "dual", expect_ok=True)
+    current = engine.Docx(Path(r2["base"]))
+    current_by = current.by_pid()
+    worse_rows = [{"pid": t["pid"], "text": current_by[t["pid"]].text, "op": "O1"} for t in r2["tasks"]]
+    worse_rows[0]["text"] += "综上所述，该方法具有重要意义。"
+    write_edits(worse, worse_rows)
     run("save-edits", "--path", str(paper), "--file", str(worse), expect_ok=True)
     f2 = run("finish", "--path", str(paper))
     check("finish：恶化稿被拒", f2.get("ok") is False and f2["verdict"] == "rejected", str(f2))
+    check("finish：候选稿篇级失败为未通过", f2["check_status"] == "not_passed", str(f2["check_status"]))
     check("finish：拒绝原因含风险分", any("风险分" in x for x in f2["reasons"]), str(f2["reasons"]))
     st = run("status", "--path", str(paper), expect_ok=True)
     check("回退：基础稿仍是第 1 轮", st["base"] == str(out_docx), st["base"])
     check("回退：被拒稿留档", (sd / "rounds" / "r2" / "rejected.docx").exists())
 
+    accepted_state = json.loads((sd / "state.json").read_text(encoding="utf-8"))
     paper.write_bytes(paper.read_bytes() + b"")
     with open(paper, "ab") as fh:
         fh.write(b"")
@@ -236,6 +330,9 @@ def main() -> None:
     arch = run("diagnose", "--path", str(paper), expect_ok=True)
     check("重新诊断：旧产物归档", any((tmp / "state" / "archive").iterdir()))
     check("重新诊断：轮次清零", run("status", "--path", str(paper))["rounds"] == [])
+    archived_dir = next((tmp / "state" / "archive").iterdir())
+    archived_base = engine.base_info(accepted_state, archived_dir)[0]
+    check("归档状态基础稿路径可重定位", archived_base.exists() and archived_base != out_docx, str(archived_base))
 
     for i in range(5):
         rr = run("rewrite", "--path", str(paper), "--mode", "aigc", expect_ok=True)
@@ -250,6 +347,98 @@ def main() -> None:
     check(".doc 明确拒绝", run("diagnose", "--path", str(doc_file)).get("ok") is False)
     lst = run("status", expect_ok=True)
     check("status 列出最近文档", len(lst["docs"]) >= 1)
+
+    localized = tmp / "localized.docx"
+    make_localized_fixture(localized)
+    ld = run("diagnose", "--path", str(localized), expect_ok=True)
+    check("本地化标题样式锁定", ld["doc"]["locked_reasons"].get("标题") == 2, str(ld["doc"]["locked_reasons"]))
+    check("样式继承标题锁定", ld["doc"]["rewritable"] == 4, str(ld["doc"]))
+
+    unknown = tmp / "unknown-style.docx"
+    make_unknown_style_fixture(unknown)
+    unknown_doc = engine.Docx(unknown)
+    unknown_para = next(p for p in unknown_doc.paras if p.text == BODY4)
+    check("未知样式保守锁定", unknown_para.locked and "未知样式" in unknown_para.reasons, str(unknown_para.reasons))
+
+    tx = tmp / "transaction.docx"
+    make_fixture(tx)
+    run("diagnose", "--path", str(tx), expect_ok=True)
+    before_tx = run("status", "--path", str(tx), expect_ok=True)
+    tx.write_bytes(b"not a docx")
+    invalid = run("diagnose", "--path", str(tx))
+    check("无效重新诊断被拒", invalid.get("ok") is False)
+    after_tx = run("status", "--path", str(tx), expect_ok=True)
+    check("无效重新诊断保留旧状态", after_tx["state_dir"] == before_tx["state_dir"]
+          and after_tx["base_metrics"] == before_tx["base_metrics"], str(after_tx))
+    check("诊断失败无临时状态残留", not any((tmp / "state" / "docs").glob(".*")))
+
+    concurrent = tmp / "concurrent.docx"
+    make_fixture(concurrent)
+    run("diagnose", "--path", str(concurrent), expect_ok=True)
+    procs = [subprocess.Popen([sys.executable, str(ENGINE), "rewrite", "--path", str(concurrent), "--mode", "dual"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+             for _ in range(12)]
+    concurrent_out = [p.communicate() for p in procs]
+    concurrent_results = [json.loads(out.strip().splitlines()[-1]) for out, _ in concurrent_out]
+    check("12 个并发 rewrite 全部成功", all(p.returncode == 0 and j.get("ok") is True
+          for p, j in zip(procs, concurrent_results)), str(concurrent_results))
+    check("并发 rewrite 只生成一轮", all(j.get("round") == 1 for j in concurrent_results))
+    check("并发后状态可读", run("status", "--path", str(concurrent), expect_ok=True)["pending"] is True)
+
+    partial = tmp / "partial.docx"
+    make_fixture(partial)
+    run("diagnose", "--path", str(partial), expect_ok=True)
+    pr = run("rewrite", "--path", str(partial), "--mode", "dual", expect_ok=True)
+    pdoc = engine.Docx(Path(pr["state_dir"]) / "original.docx")
+    replacements = {BODY1: EDIT1, BODY2: EDIT2, BODY3: EDIT3}
+    pby = pdoc.by_pid()
+    partial_rows = []
+    for t in pr["tasks"]:
+        text = pby[t["pid"]].text
+        if text in replacements:
+            partial_rows.append({"pid": t["pid"], "text": replacements[text], "op": "O1"})
+    check("部分完成夹具至少两段", len(partial_rows) >= 2, str(partial_rows))
+    subset = tmp / "subset.jsonl"
+    write_edits(subset, partial_rows[:2])
+    pl = run("lint", "--path", str(partial), "--edits", str(subset))
+    check("lint 报告未提交任务", pl.get("ok") is False and any(g["gate"] == "任务覆盖"
+          for r in pl["rejected"] for g in r["gates"]), str(pl))
+    strict = run("finish", "--path", str(partial), "--edits", str(subset))
+    check("默认拒绝部分完成", strict.get("ok") is False and strict["verdict"] == "rejected"
+          and strict["docx"] is None, str(strict))
+    check("不完整任务集三态为拒绝", strict["check_status"] == "rejected", str(strict["check_status"]))
+    run("rewrite", "--path", str(partial), "--mode", "dual", expect_ok=True)
+    accepted_partial = run("finish", "--path", str(partial), "--edits", str(subset), "--allow-partial")
+    check("显式允许部分完成", accepted_partial.get("ok") is True and accepted_partial.get("partial") is True,
+          str(accepted_partial))
+    check("部分完成仍是本地门禁通过", accepted_partial["check_status"] == "passed", str(accepted_partial))
+    check("部分完成报告标记", json.loads(Path(accepted_partial["comparison"]).read_text(encoding="utf-8"))["partial"] is True)
+
+    old_entries = engine.MAX_ZIP_ENTRIES
+    engine.MAX_ZIP_ENTRIES = 1
+    try:
+        try:
+            engine.Docx(partial)
+            check("ZIP 条目预算拒绝", False)
+        except ValueError as e:
+            check("ZIP 条目预算拒绝", "条目数超过预算" in str(e), str(e))
+    finally:
+        engine.MAX_ZIP_ENTRIES = old_entries
+    old_xml = engine.MAX_XML_BYTES
+    engine.MAX_XML_BYTES = 10
+    try:
+        try:
+            engine.Docx(partial)
+            check("XML 读取预算拒绝", False)
+        except ValueError as e:
+            check("XML 读取预算拒绝", "超过预算" in str(e), str(e))
+        try:
+            pdoc.save(pdoc.xml.encode("utf-8"), tmp / "over-budget.docx")
+            check("XML 写入预算拒绝", False)
+        except ValueError as e:
+            check("XML 写入预算拒绝", "超过预算" in str(e), str(e))
+    finally:
+        engine.MAX_XML_BYTES = old_xml
 
     print(f"\nALL {PASS} ASSERTIONS PASSED")
     print("fixture/state:", tmp)

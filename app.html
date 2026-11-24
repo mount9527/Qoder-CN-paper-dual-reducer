@@ -30,6 +30,7 @@
   .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
   label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+  label.check { display: flex; align-items: center; gap: 7px; margin: 12px 0 0; color: var(--ink); }
   input[type=text], select, textarea {
     width: 100%; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
     border-radius: 8px; padding: 9px 11px; font: inherit;
@@ -109,11 +110,12 @@
   <section class="panel hidden" id="overview">
     <h2 style="margin-top:0">诊断概览 <span class="mono muted" id="doc-name"></span></h2>
     <div class="cards" id="cards"></div>
-    <h3>9 维痕迹命中</h3>
+    <h3>9 个文风规则维度命中</h3>
+    <p class="muted">早期说明中的 6 维是旧口径；当前 9 维用于定位改写目标，并非 9 个独立检测模型。</p>
     <div class="chips" id="dims"></div>
-    <h3>Top 高风险 / 重复段落</h3>
+    <h3>最需关注 / 重复段落（最多 12 段）</h3>
     <div class="table-scroll"><table id="top-table">
-      <thead><tr><th>pid</th><th>风险</th><th>分</th><th>重复</th><th>算子</th><th>原文预览</th></tr></thead>
+      <thead><tr><th>pid</th><th>分数段</th><th>分</th><th>重复占比</th><th>算子</th><th>原文预览</th></tr></thead>
       <tbody></tbody>
     </table></div>
     <h3>生成改写任务</h3>
@@ -144,7 +146,7 @@
     </div>
     <details><summary>查看任务清单（prompts）</summary>
       <div class="table-scroll"><table id="prompt-table">
-        <thead><tr><th>pid</th><th>算子</th><th>分</th><th>重复</th><th>要求</th></tr></thead>
+        <thead><tr><th>pid</th><th>算子</th><th>分</th><th>重复占比</th><th>要求</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </details>
@@ -156,6 +158,7 @@
       <button id="lint" class="secondary">预检</button>
       <button id="finish">回填并复检</button>
     </div>
+    <label class="check"><input id="allow-partial" type="checkbox"> 允许部分完成（明确跳过被拒或未提交段）</label>
     <div id="lint-result"></div>
   </section>
 
@@ -182,9 +185,10 @@
 
   <footer>
     <ul>
-      <li>风险分与重复率是篇内相对指标，只用于同篇排序，不是任何检测平台的概率；不承诺通过率。</li>
+      <li>结果分为通过、未通过、拒绝，仅表示本地门禁状态，不表示检测概率或平台通过率。</li>
+      <li>风险分与重复率是篇内相对指标；门禁通过不等于原稿更优，请比较后再替换。</li>
       <li>标题、表格、代码、公式、脚注、参考文献一律不改；不新增数字/引用/事实。</li>
-      <li>v0.1 为离线核心，无真机 AIGC 模型分数；改稿必须由作者逐段复核。文档不出本机。</li>
+      <li>v0.2.x 为离线核心，无真机 AIGC 模型分数；改稿必须由作者逐段复核。文档不出本机。</li>
     </ul>
   </footer>
 </main>

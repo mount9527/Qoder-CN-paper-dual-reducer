@@ -8,5 +8,5 @@ skill-paper-dual-reducer（https://github.com/mount9527/skill-paper-dual-reducer
 算子编号、门禁阈值与流水线语义沿用其公开规格。
 
 AIGC 真机检测模型（yuchuantian/AIGC_detector_zhv3，Apache-2.0，基座
-chinese-roberta-wwm-ext 亦为 Apache-2.0）不随本仓库分发；v0.1 为离线核心，未包含真机检测，
+chinese-roberta-wwm-ext 亦为 Apache-2.0）不随本仓库分发；v0.2.x 为离线核心，未包含真机检测，
 后续版本如引入将由使用者首次运行时自行从 HuggingFace 下载权重。

@@ -63,17 +63,37 @@ try {
   const tasks = prompts.structuredContent.prompts
   const save = await call("pd_save_edits", { path: paper, jsonl: JSON.stringify({ pid: tasks[0].pid, text: tasks[0].text, op: "O1" }) + "\n" })
   check("pd_save_edits ok", save.structuredContent?.ok === true, JSON.stringify(save).slice(0, 150))
-  const edits = tasks.map(t => ({ pid: t.pid, text: t.text, op: t.ops[0] }))
+  const edits = tasks.map(t => ({ pid: t.pid, text: t.text + "该方法具有重要意义。", op: t.ops[0] }))
   const lint = await call("paper_dual_lint", { path: paper, edits })
   check("inline edits 恒等改写过预检", lint.structuredContent.passed_count === edits.length, JSON.stringify(lint.structuredContent).slice(0, 200))
   const fin = await call("paper_dual_apply_edits", { path: paper, edits })
-  check("恒等改写被复检拒绝（指标未降）", fin.structuredContent.verdict === "rejected", JSON.stringify(fin.structuredContent).slice(0, 200))
+  check("恶化候选稿未通过且已回退", fin.structuredContent.verdict === "rejected"
+    && fin.structuredContent.check_status === "not_passed" && fin.isError === true, JSON.stringify(fin.structuredContent).slice(0, 200))
   const view = await call("pd_get_view", { path: paper, round: 1 })
-  check("pd_get_view 含对照与报告路径", view.structuredContent.comparison.round === 1 && typeof view.structuredContent.reportPath === "string")
+  check("pd_get_view 含对照、报告路径与下载分支", view.structuredContent.comparison.round === 1
+    && typeof view.structuredContent.reportPath === "string" && view.structuredContent.reportDownload?.text === view.structuredContent.report)
   const rep = await call("pd_get_file", { path: paper, round: 1, kind: "report" })
   check("pd_get_file 报告含文本", rep.structuredContent.text.includes("论文双降报告"))
   const noDocx = await call("pd_get_file", { path: paper, round: 1, kind: "docx" })
   check("被拒轮无改稿可下载", noDocx.isError === true)
+
+  const rw2 = await call("paper_dual_rewrite", { path: paper, mode: "dual", style: "plain" })
+  check("重新生成待回填轮", rw2.structuredContent?.ok === true)
+  const subset = tasks.slice(0, -1)
+  const partialLint = await call("paper_dual_lint", { path: paper, edits: subset })
+  check("lint 失败传播 isError 与结构化详情", partialLint.isError === true
+    && partialLint.structuredContent?.ok === false
+    && partialLint.structuredContent.rejected.some(r => r.gates.some(g => g.gate === "任务覆盖")),
+    JSON.stringify(partialLint).slice(0, 200))
+  const strict = await call("paper_dual_apply_edits", { path: paper, edits: subset })
+  check("MCP 默认拒绝部分完成", strict.structuredContent.verdict === "rejected"
+    && strict.structuredContent.check_status === "rejected"
+    && strict.structuredContent.reasons.some(r => r.includes("未全部通过")), JSON.stringify(strict.structuredContent).slice(0, 200))
+  await call("paper_dual_rewrite", { path: paper, mode: "dual", style: "plain" })
+  const explicitPartial = await call("paper_dual_apply_edits", { path: paper, edits: subset, allowPartial: true })
+  check("MCP 显式部分完成绕过覆盖闸门", !explicitPartial.structuredContent.reasons.some(r => r.includes("未全部通过"))
+    && explicitPartial.structuredContent.check_status === "passed", JSON.stringify(explicitPartial.structuredContent).slice(0, 200))
+
   console.log(`\nALL ${pass} INTEGRATION ASSERTIONS PASSED`)
 } catch (e) {
   console.error("INTEGRATION ERROR:", e.message); console.error("stderr:", stderr.slice(-800)); process.exitCode = 1

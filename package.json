@@ -1,13 +1,16 @@
 {
   "name": "paper-dual-qoder",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "论文双降工作台 Qoder CN 插件（MCP 服务与页面，零 npm 依赖）",
   "scripts": {
     "start": "node server.mjs",
     "check": "node --check server.mjs && node --check app.js",
+    "test": "npm run test:engine && npm run check && npm run smoke && npm run integration",
+    "test:engine": "python skills/paper-dual/scripts/test_engine.py",
     "smoke": "node scripts/smoke.mjs",
-    "integration": "node scripts/integration.mjs"
+    "integration": "node scripts/integration.mjs",
+    "test:ui": "node dist/ui-harness.mjs"
   }
 }
